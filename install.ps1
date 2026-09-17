@@ -25,10 +25,9 @@ Write-Host ''
 
 # 1. Get the source: from this folder if we're inside the repo, otherwise from GitHub.
 New-Item -ItemType Directory -Force $Install | Out-Null
-$local = if ($PSScriptRoot) { $PSScriptRoot } else { '' }
+$local = if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot 'NightDimmer.cs'))) { $PSScriptRoot } else { $null }
 foreach ($f in $Files) {
-    $src = Join-Path $local $f
-    if ($local -and (Test-Path $src)) { Copy-Item $src (Join-Path $Install $f) -Force }
+    if ($local) { Copy-Item (Join-Path $local $f) (Join-Path $Install $f) -Force }
     else {
         Write-Host "  downloading $f"
         Invoke-WebRequest -UseBasicParsing "$Raw/$f" -OutFile (Join-Path $Install $f)
