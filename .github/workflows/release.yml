@@ -1,0 +1,59 @@
+# Builds NightDimmer.exe on a clean GitHub runner and attaches it to a release
+# whenever a v* tag is pushed. Also runs a build check on every push / PR.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        shell: pwsh
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
+          Get-Item NightDimmer.exe | Select-Object Name, Length
+          (Get-Item NightDimmer.exe).VersionInfo | Select-Object ProductName, FileVersion, CompanyName
+          $hash = (Get-FileHash NightDimmer.exe -Algorithm SHA256).Hash
+          "SHA256: $hash"
+          "NightDimmer.exe  $hash" | Set-Content SHA256SUMS.txt
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NightDimmer
+          path: |
+            NightDimmer.exe
+            SHA256SUMS.txt
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $notes = @"
+          **Night Dimmer $tag** - dim, warm and blue-filter your screen for night viewing on Windows.
+
+          **Recommended install** (compiles on your PC, no SmartScreen prompt):
+          ``````powershell
+          irm https://raw.githubusercontent.com/${{ github.repository }}/main/install.ps1 | iex
+          ``````
+
+          **Portable:** download ``NightDimmer.exe`` below and run it. It is unsigned, so Windows
+          SmartScreen may show *"Windows protected your PC"* the first time - click **More info > Run anyway**.
+          Verify with ``SHA256SUMS.txt``.
+
+          Built by GitHub Actions from tag ``$tag`` (run ${{ github.run_id }}).
+          "@
+          gh release create $tag NightDimmer.exe SHA256SUMS.txt --title "Night Dimmer $tag" --notes $notes
