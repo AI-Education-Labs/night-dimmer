@@ -26,14 +26,14 @@ using Microsoft.Win32;
 [assembly: System.Reflection.AssemblyDescription("Dim and warm your screen for night viewing")]
 [assembly: System.Reflection.AssemblyCompany("AI Education Labs")]
 [assembly: System.Reflection.AssemblyCopyright("Copyright © 2026 AI Education Labs. MIT License.")]
-[assembly: System.Reflection.AssemblyVersion("1.2.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.2.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.2.1.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.2.1.0")]
 
 namespace NightDimmer
 {
     static class About
     {
-        public const string Version = "1.2.0";
+        public const string Version = "1.2.1";
         public const string Company = "AI Education Labs";
         public const string Site = "https://aiedlabs.com";
         public const string Repo = "https://github.com/AI-Education-Labs/night-dimmer";
@@ -92,6 +92,205 @@ namespace NightDimmer
     // press wakes and is swallowed (so Space doesn't also unpause a video); mouse buttons wake and
     // are swallowed; mouse movement wakes after a short grace period (Windows itself wakes the
     // monitor on movement, so the overlay must lift at the same moment).
+    // Hardware brightness for "screen off" without telling Windows the display is off (which on
+    // managed / Modern Standby PCs triggers the lock screen). Laptop panels via WMI, external
+    // monitors via DDC/CI. Previous levels are persisted so a crash mid-blackout can be undone.
+    class Backlight
+    {
+        [DllImport("dxva2.dll", SetLastError = true)] static extern bool GetNumberOfPhysicalMonitorsFromHMONITOR(IntPtr hMon, out uint count);
+        [DllImport("dxva2.dll", SetLastError = true)] static extern bool GetPhysicalMonitorsFromHMONITOR(IntPtr hMon, uint count, [Out] PHYSICAL_MONITOR[] arr);
+        [DllImport("dxva2.dll", SetLastError = true)] static extern bool DestroyPhysicalMonitors(uint count, PHYSICAL_MONITOR[] arr);
+        [DllImport("dxva2.dll", SetLastError = true)] static extern bool GetMonitorBrightness(IntPtr h, out uint min, out uint cur, out uint max);
+        [DllImport("dxva2.dll", SetLastError = true)] static extern bool SetMonitorBrightness(IntPtr h, uint value);
+        [DllImport("user32.dll")] static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr clip, MonitorEnumProc fn, IntPtr data);
+        delegate bool MonitorEnumProc(IntPtr hMon, IntPtr hdc, IntPtr rect, IntPtr data);
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct PHYSICAL_MONITOR { public IntPtr hPhysicalMonitor; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string desc; }
+
+        const string SavedKey = @"Software\NightDimmer\BacklightSaved";
+        readonly object sync = new object();
+        readonly List<KeyValuePair<string, uint>> saved = new List<KeyValuePair<string, uint>>(); // "wmi:<inst>" or "ddc:<n>" -> level
+        volatile bool wantDark;
+
+        // Lower everything as far as it goes, on a worker thread (DDC/CI is slow and must not block
+        // the UI thread, which services the wake hooks). A Restore() call during the dim cancels it.
+        public void DimAsync()
+        {
+            wantDark = true;
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                lock (sync)
+                {
+                    if (!wantDark || saved.Count > 0) return;
+                    try { DimCore(); } catch (Exception ex) { Log.W("backlight dim: " + ex.Message); }
+                    if (!wantDark) RestoreCore();
+                }
+            });
+        }
+
+        public void Restore()
+        {
+            wantDark = false;
+            lock (sync) RestoreCore();
+        }
+
+        void DimCore()
+        {
+            // laptop / tablet panel
+            try
+            {
+                foreach (KeyValuePair<string, uint> kv in ReadWmi())
+                {
+                    saved.Add(new KeyValuePair<string, uint>("wmi:" + kv.Key, kv.Value));
+                    Persist();
+                    if (!wantDark) return;
+                    SetWmi(kv.Key, 0);
+                }
+            }
+            catch (Exception ex) { Log.W("wmi brightness: " + ex.Message); }
+            // external monitors (DDC/CI)
+            int n = 0;
+            EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, delegate(IntPtr hMon, IntPtr hdc, IntPtr rect, IntPtr data)
+            {
+                if (!wantDark) return false;
+                uint count;
+                if (!GetNumberOfPhysicalMonitorsFromHMONITOR(hMon, out count) || count == 0) return true;
+                PHYSICAL_MONITOR[] pm = new PHYSICAL_MONITOR[count];
+                if (!GetPhysicalMonitorsFromHMONITOR(hMon, count, pm)) return true;
+                for (int i = 0; i < count; i++)
+                {
+                    uint min, cur, max;
+                    if (GetMonitorBrightness(pm[i].hPhysicalMonitor, out min, out cur, out max))
+                    {
+                        saved.Add(new KeyValuePair<string, uint>("ddc:" + n, cur));
+                        Persist();
+                        if (!SetMonitorBrightness(pm[i].hPhysicalMonitor, min)) Log.W("ddc dim failed on monitor " + n + " err=" + Marshal.GetLastWin32Error());
+                    }
+                    n++;
+                }
+                DestroyPhysicalMonitors(count, pm);
+                return true;
+            }, IntPtr.Zero);
+            Log.W("backlight dimmed on " + saved.Count + " device(s)");
+        }
+
+        void RestoreCore()
+        {
+            if (saved.Count == 0) return;
+            bool ok = true;
+            foreach (KeyValuePair<string, uint> kv in saved)
+                if (kv.Key.StartsWith("wmi:"))
+                {
+                    try
+                    {
+                        uint now = 0;
+                        for (int attempt = 0; attempt < 3; attempt++)
+                        {
+                            SetWmi(kv.Key.Substring(4), kv.Value);
+                            System.Threading.Thread.Sleep(300); // WMI reports the old level for a moment
+                            now = 0;
+                            foreach (KeyValuePair<string, uint> r in ReadWmi()) if (r.Key == kv.Key.Substring(4)) now = r.Value;
+                            if (now == kv.Value) break;
+                        }
+                        if (now != kv.Value) { ok = false; Log.W("wmi restore: asked " + kv.Value + ", panel reports " + now); }
+                    }
+                    catch (Exception ex) { ok = false; Log.W("backlight restore wmi failed: " + ex.Message); }
+                }
+            Dictionary<int, uint> ddc = new Dictionary<int, uint>(); // monitor index -> level
+            foreach (KeyValuePair<string, uint> kv in saved) if (kv.Key.StartsWith("ddc:")) ddc[int.Parse(kv.Key.Substring(4))] = kv.Value;
+            if (ddc.Count > 0)
+            {
+                int n = 0;
+                EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, delegate(IntPtr hMon, IntPtr hdc, IntPtr rect, IntPtr data)
+                {
+                    uint count;
+                    if (!GetNumberOfPhysicalMonitorsFromHMONITOR(hMon, out count) || count == 0) return true;
+                    PHYSICAL_MONITOR[] pm = new PHYSICAL_MONITOR[count];
+                    if (!GetPhysicalMonitorsFromHMONITOR(hMon, count, pm)) return true;
+                    for (int i = 0; i < count; i++, n++)
+                    {
+                        uint level;
+                        if (!ddc.TryGetValue(n, out level)) continue; // this monitor never answered DDC (e.g. laptop panel)
+                        if (SetMonitorBrightness(pm[i].hPhysicalMonitor, level)) continue;
+                        int err = Marshal.GetLastWin32Error();
+                        System.Threading.Thread.Sleep(150); // DDC/CI is flaky right after another command
+                        if (!SetMonitorBrightness(pm[i].hPhysicalMonitor, level)) { ok = false; Log.W("ddc restore failed on monitor " + n + " err=" + err); }
+                    }
+                    DestroyPhysicalMonitors(count, pm);
+                    return true;
+                }, IntPtr.Zero);
+            }
+            Log.W("backlight restored (" + saved.Count + " device(s)" + (ok ? "" : ", with errors") + ")");
+            if (ok)
+            {
+                saved.Clear();
+                try { Registry.CurrentUser.DeleteSubKey(SavedKey, false); } catch { }
+            }
+            // on failure the saved levels stay on disk so the next start can retry
+        }
+
+        // Called at startup: if a previous run died while dimmed, put the levels back.
+        public void RecoverIfNeeded()
+        {
+            lock (sync)
+            {
+                using (RegistryKey k = Registry.CurrentUser.OpenSubKey(SavedKey))
+                {
+                    if (k == null) return;
+                    foreach (string name in k.GetValueNames())
+                        saved.Add(new KeyValuePair<string, uint>(name, Convert.ToUInt32(k.GetValue(name))));
+                }
+                if (saved.Count > 0) { Log.W("recovering backlight from previous run"); RestoreCore(); }
+            }
+        }
+
+        void Persist()
+        {
+            try
+            {
+                using (RegistryKey k = Registry.CurrentUser.CreateSubKey(SavedKey))
+                    foreach (KeyValuePair<string, uint> kv in saved) k.SetValue(kv.Key, (int)kv.Value, RegistryValueKind.DWord);
+            }
+            catch { }
+        }
+
+        // WMI's COM objects are apartment-bound and our wake path runs inside a low-level hook
+        // callback (RPC_E_WRONG_THREAD otherwise), so every WMI call gets its own MTA thread.
+        static void OnMta(Action work)
+        {
+            Exception err = null;
+            System.Threading.Thread t = new System.Threading.Thread(delegate() { try { work(); } catch (Exception ex) { err = ex; } });
+            t.SetApartmentState(System.Threading.ApartmentState.MTA);
+            t.IsBackground = true;
+            t.Start();
+            if (!t.Join(4000)) throw new TimeoutException("WMI call timed out");
+            if (err != null) throw err;
+        }
+
+        static List<KeyValuePair<string, uint>> ReadWmi()
+        {
+            List<KeyValuePair<string, uint>> list = new List<KeyValuePair<string, uint>>();
+            OnMta(delegate
+            {
+                using (var cls = new System.Management.ManagementClass(@"root\WMI", "WmiMonitorBrightness", null))
+                foreach (System.Management.ManagementObject o in cls.GetInstances())
+                    list.Add(new KeyValuePair<string, uint>((string)o["InstanceName"], Convert.ToUInt32(o["CurrentBrightness"])));
+            });
+            return list;
+        }
+
+        static void SetWmi(string instance, uint level)
+        {
+            OnMta(delegate
+            {
+                using (var cls = new System.Management.ManagementClass(@"root\WMI", "WmiMonitorBrightnessMethods", null))
+                foreach (System.Management.ManagementObject o in cls.GetInstances())
+                    if ((string)o["InstanceName"] == instance)
+                        o.InvokeMethod("WmiSetBrightness", new object[] { (uint)1, (byte)level });
+            });
+        }
+    }
+
     class InputWatch : IDisposable
     {
         delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
@@ -109,7 +308,7 @@ namespace NightDimmer
         int swallowUpVk = -1;
         DateTime moveArmAt;
         int lastX = int.MinValue, lastY;
-        public event Action Woken;
+        public event Action<string> Woken;
 
         public InputWatch() { kbProc = KbCallback; msProc = MsCallback; }
 
@@ -135,10 +334,10 @@ namespace NightDimmer
             // else: keyboard hook lingers just long enough to eat the matching key-up
         }
 
-        void Fire()
+        void Fire(string why)
         {
             armed = false;
-            if (Woken != null) Woken();
+            if (Woken != null) Woken(why);
         }
 
         IntPtr KbCallback(int nCode, IntPtr wParam, IntPtr lParam)
@@ -150,7 +349,7 @@ namespace NightDimmer
                 if (armed && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN))
                 {
                     swallowUpVk = vk;
-                    Fire();
+                    Fire("key vk=" + vk);
                     return new IntPtr(1);
                 }
                 if ((msg == WM_KEYUP || msg == WM_SYSKEYUP) && vk == swallowUpVk)
@@ -170,14 +369,14 @@ namespace NightDimmer
                 int msg = wParam.ToInt32();
                 if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN || msg == WM_XBUTTONDOWN || msg == WM_MOUSEWHEEL)
                 {
-                    Fire();
+                    Fire("mouse button 0x" + msg.ToString("X"));
                     return new IntPtr(1);
                 }
                 if (msg == WM_MOUSEMOVE)
                 {
                     int x = Marshal.ReadInt32(lParam), y = Marshal.ReadInt32(lParam, 4); // MSLLHOOKSTRUCT.pt
                     if (lastX == int.MinValue) { lastX = x; lastY = y; }
-                    else if (DateTime.UtcNow >= moveArmAt && (Math.Abs(x - lastX) > 3 || Math.Abs(y - lastY) > 3)) Fire();
+                    else if (DateTime.UtcNow >= moveArmAt && (Math.Abs(x - lastX) > 12 || Math.Abs(y - lastY) > 12)) Fire("mouse move " + (x - lastX) + "," + (y - lastY));
                 }
             }
             return CallNextHookEx(ms, nCode, wParam, lParam);
@@ -681,6 +880,7 @@ namespace NightDimmer
         public int Warmth = 40;    // 0..100 %  amber tone
         public int Blue = 30;      // 0..100 %  blue-light cut
         public bool Enabled = true;
+        public bool PowerOff = true;   // Screen off also sends DPMS power-off (auto-disabled if that locks the PC)
         public bool FirstRun = true;
 
         public static Settings Load()
@@ -692,6 +892,7 @@ namespace NightDimmer
                 s.Dim      = Clamp(Convert.ToInt32(k.GetValue("Dim", s.Dim)), 0, TrayApp.MAX_DIM);
                 s.Warmth   = Clamp(Convert.ToInt32(k.GetValue("Warmth", s.Warmth)), 0, 100);
                 s.Blue     = Clamp(Convert.ToInt32(k.GetValue("Blue", s.Blue)), 0, 100);
+                s.PowerOff = Convert.ToInt32(k.GetValue("PowerOff", 1)) != 0;
                 s.Enabled  = Convert.ToInt32(k.GetValue("Enabled", 1)) != 0;
                 s.FirstRun = Convert.ToInt32(k.GetValue("FirstRun", 1)) != 0;
             }
@@ -705,6 +906,7 @@ namespace NightDimmer
                 k.SetValue("Dim", Dim);
                 k.SetValue("Warmth", Warmth);
                 k.SetValue("Blue", Blue);
+                k.SetValue("PowerOff", PowerOff ? 1 : 0);
                 k.SetValue("Enabled", Enabled ? 1 : 0);
                 k.SetValue("FirstRun", FirstRun ? 1 : 0);
             }
@@ -732,7 +934,7 @@ namespace NightDimmer
         readonly int W = 380, P = 24;
 
         readonly Slider dim, warm, blue;
-        readonly Toggle master, startup;
+        readonly Toggle master, startup, power;
         readonly Pill[] presets = new Pill[3];
         readonly Pill unlockLink;
         readonly Font fTitle, fSub, fLabel, fSection, fValue, fHint;
@@ -741,7 +943,7 @@ namespace NightDimmer
 
         // y positions (unscaled)
         const int Y_HEADER = 22, Y_SUB = 54, Y_MASTER = 92, Y_DIM = 142, Y_WARM = 208, Y_BLUE = 274, Y_PRESET = 340,
-                  Y_BLACKOUT = 386, Y_UNLOCK = 434, Y_DIV = 464, Y_START = 480, Y_FOOT = 522, Y_CREDIT = 558, H = 588;
+                  Y_BLACKOUT = 386, Y_UNLOCK = 434, Y_DIV = 464, Y_START = 480, Y_POWER = 514, Y_FOOT = 562, Y_CREDIT = 598, H = 628;
 
         public PanelForm(Settings settings, int maxDim, Action onChanged, Action onExit, Func<bool> isStartup, Action<bool> setStartupFn,
                          Func<bool> gammaCapped, Action unlockGamma, Action blackoutFn)
@@ -824,6 +1026,11 @@ namespace NightDimmer
             Controls.Add(unlockLink);
 
             // startup toggle
+            power = new Toggle(); power.SetBounds(S(W - P - 40), S(Y_POWER), S(40), S(22));
+            power.CheckedChanged += delegate { if (syncing) return; s.PowerOff = power.Checked; changed(); };
+            Controls.Add(power);
+            tip.SetToolTip(power, "Off: Screen off only dims the backlight and blacks out - use this if your PC shows the sign-in screen on wake.");
+
             startup = new Toggle(); startup.SetBounds(S(W - P - 40), S(Y_START), S(40), S(22));
             startup.CheckedChanged += delegate { if (syncing) return; setStartup(startup.Checked); };
             Controls.Add(startup);
@@ -906,6 +1113,7 @@ namespace NightDimmer
             blue.SetSilent(s.Blue);
             master.SetSilent(s.Enabled);
             startup.SetSilent(getStartup());
+            power.SetSilent(s.PowerOff);
             unlockLink.Visible = isCapped();
             for (int i = 0; i < 3; i++)
                 presets[i].Active = s.Enabled && s.Dim == PresetDim[i] && s.Warmth == PresetWarm[i] && s.Blue == PresetBlue[i];
@@ -970,6 +1178,8 @@ namespace NightDimmer
             using (Pen p = new Pen(Theme.Border)) g.DrawLine(p, S(P), S(Y_DIV), S(W - P), S(Y_DIV));
 
             Txt(g, "Start with Windows", fSub, P, Y_START + 3, Theme.Text);
+            Txt(g, "Screen off powers monitors down", fSub, P, Y_POWER + 3, Theme.Text);
+            Txt(g, s.PowerOff ? "turn off if your PC asks you to sign in on wake" : "off: backlight to minimum + black overlay", fHint, P, Y_POWER + 22, Theme.Muted);
 
             Txt(g, "Ctrl+Alt+D  panel   ·   0  on / off   ·   B  screen off", fHint, P, Y_FOOT - 2, Theme.Muted);
             Txt(g, "Ctrl+Alt+ − / =  dim   ·   9  warmth   ·   8  blue", fHint, P, Y_FOOT + 13, Theme.Muted);
@@ -1002,6 +1212,8 @@ namespace NightDimmer
         readonly Icon iconOn, iconOff;
         readonly Gamma gamma;
         readonly InputWatch input = new InputWatch();
+        readonly Backlight backlight = new Backlight();
+        DateTime powerOffSentAt = DateTime.MinValue;
         bool blackout;
 
         PanelForm panel;
@@ -1024,7 +1236,24 @@ namespace NightDimmer
             {
                 Log.W("ERROR " + e.Exception); gamma.Restore();
             };
-            SystemEvents.SessionEnding += delegate { gamma.Restore(); };
+            SystemEvents.SessionEnding += delegate { gamma.Restore(); backlight.Restore(); };
+            SystemEvents.SessionSwitch += delegate(object o, SessionSwitchEventArgs e)
+            {
+                // Managed / Modern Standby PCs lock the moment the display powers off. If that happens
+                // right after our power-off, stop using DPMS on this machine and say so.
+                if (e.Reason == SessionSwitchReason.SessionLock && blackout && s.PowerOff &&
+                    (DateTime.UtcNow - powerOffSentAt).TotalSeconds < 15)
+                {
+                    s.PowerOff = false;
+                    s.Save();
+                    Log.W("lock screen followed power-off -> PowerOff disabled");
+                    EndBlackout();
+                    tray.ShowBalloonTip(10000, "Night Dimmer",
+                        "This PC locks when the display powers off (a sign-in policy). Screen off will now dim the " +
+                        "backlight and black out instead. You can re-enable power-off in the panel.", ToolTipIcon.Info);
+                }
+            };
+            backlight.RecoverIfNeeded();
 
             tray = new NotifyIcon();
             tray.MouseClick += delegate(object o, MouseEventArgs e)
@@ -1046,7 +1275,7 @@ namespace NightDimmer
             hotkeysOk &= Reg(HK_PANEL,    ca, Keys.D);
             hotkeysOk &= Reg(HK_BLUE,     ca, Keys.D8);
             hotkeysOk &= Reg(HK_BLACKOUT, ca, Keys.B);
-            input.Woken += delegate { EndBlackout(); };
+            input.Woken += delegate(string why) { Log.W("wake: " + why); EndBlackout(); };
 
             SystemEvents.DisplaySettingsChanged += delegate { gamma.Refresh(); BuildOverlays(); };
             SystemEvents.PowerModeChanged += delegate(object o, PowerModeChangedEventArgs e)
@@ -1129,7 +1358,7 @@ namespace NightDimmer
             foreach (Screen sc in Screen.AllScreens)
             {
                 OverlayForm f = new OverlayForm(sc.Bounds);
-                f.Clicked += delegate { EndBlackout(); };
+                f.Clicked += delegate { Log.W("wake: overlay click"); EndBlackout(); };
                 overlays.Add(f);
             }
             if (blackout) { blackout = false; StartBlackout(); } else Apply();
@@ -1155,7 +1384,13 @@ namespace NightDimmer
             // Give the click/keystroke that started this a moment to settle, or the display wakes straight back up.
             System.Windows.Forms.Timer t = new System.Windows.Forms.Timer();
             t.Interval = 600;
-            t.Tick += delegate { t.Stop(); t.Dispose(); if (blackout) MonitorPower(false); };
+            t.Tick += delegate
+            {
+                t.Stop(); t.Dispose();
+                if (!blackout) return;
+                backlight.DimAsync();
+                if (s.PowerOff) { powerOffSentAt = DateTime.UtcNow; MonitorPower(false); }
+            };
             t.Start();
         }
 
@@ -1165,7 +1400,8 @@ namespace NightDimmer
             if (!blackout) return;
             blackout = false;
             Log.W("blackout off");
-            MonitorPower(true);
+            if (s.PowerOff) MonitorPower(true);
+            backlight.Restore();
             foreach (OverlayForm f in overlays) f.SetBlackout(false);
             Apply();
         }
@@ -1234,7 +1470,7 @@ namespace NightDimmer
         void OnHotkey(int id)
         {
             if (id > HK_ALT) id -= HK_ALT;
-            if (blackout && id != HK_BLACKOUT) { EndBlackout(); return; } // any hotkey wakes, nothing more
+            if (blackout && id != HK_BLACKOUT) { Log.W("wake: hotkey " + id); EndBlackout(); return; } // any hotkey wakes, nothing more
             switch (id)
             {
                 case HK_BLACKOUT: ToggleBlackout(); return;
@@ -1359,6 +1595,7 @@ namespace NightDimmer
             topTimer.Stop();
             input.Dispose();
             gamma.Restore();
+            backlight.Restore();
             if (panel != null && !panel.IsDisposed) panel.Close();
             foreach (OverlayForm f in overlays) f.Close();
             overlays.Clear();

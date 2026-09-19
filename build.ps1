@@ -9,6 +9,6 @@ $out  = Join-Path $PSScriptRoot 'NightDimmer.exe'
 $icon = Join-Path $PSScriptRoot 'moon.ico'
 if (-not (Test-Path $icon)) { & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'make-icon.ps1') }
 
-& $csc /nologo /target:winexe /optimize+ /out:$out /win32icon:$icon /r:System.Windows.Forms.dll /r:System.Drawing.dll $src
+& $csc /nologo /target:winexe /optimize+ /out:$out /win32icon:$icon /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Management.dll $src
 if ($LASTEXITCODE -ne 0) { throw "Build failed." }
 Write-Host "Built $out"
