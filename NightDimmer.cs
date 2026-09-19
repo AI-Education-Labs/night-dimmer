@@ -7,7 +7,7 @@
 // ships with Windows.
 //
 // Build:   powershell -ExecutionPolicy Bypass -File build.ps1
-// Hotkeys: Ctrl+Alt+D  panel     Ctrl+Alt+0  on/off     Ctrl+Alt+-/=  darker/brighter   Ctrl+Alt+B  blackout
+// Hotkeys: Ctrl+Alt+D  panel     Ctrl+Alt+0  on/off     Ctrl+Alt+-/=  darker/brighter   Ctrl+Alt+B  screen off
 //          Ctrl+Alt+9  warmth    Ctrl+Alt+8  blue cut   (alternates: PgDn/PgUp/End/Home)
 // CLI:     NightDimmer.exe [--dim N] [--warmth N] [--blue N] [--blackout] [--on] [--off] [--toggle] [--panel] [--exit]
 //          If an instance is already running the command is forwarded to it.
@@ -26,14 +26,14 @@ using Microsoft.Win32;
 [assembly: System.Reflection.AssemblyDescription("Dim and warm your screen for night viewing")]
 [assembly: System.Reflection.AssemblyCompany("AI Education Labs")]
 [assembly: System.Reflection.AssemblyCopyright("Copyright © 2026 AI Education Labs. MIT License.")]
-[assembly: System.Reflection.AssemblyVersion("1.1.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.1.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.2.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.2.0.0")]
 
 namespace NightDimmer
 {
     static class About
     {
-        public const string Version = "1.1.0";
+        public const string Version = "1.2.0";
         public const string Company = "AI Education Labs";
         public const string Site = "https://aiedlabs.com";
         public const string Repo = "https://github.com/AI-Education-Labs/night-dimmer";
@@ -55,6 +55,7 @@ namespace NightDimmer
         public const int WM_NCLBUTTONDOWN = 0x00A1;
         public const int HTCAPTION = 2;
         public const int WM_APP_CMD = 0x8000 + 1;
+        public const int WM_SYSCOMMAND = 0x0112, SC_MONITORPOWER = 0xF170;
         public const uint MOD_ALT = 0x0001, MOD_CONTROL = 0x0002;
         public const string CTL_TITLE = "NightDimmerCtl";
 
@@ -87,42 +88,60 @@ namespace NightDimmer
     // Commands accepted from the command line / a second instance.
     enum Cmd { Dim = 1, Warmth = 2, Toggle = 3, On = 4, Off = 5, Panel = 6, Exit = 7, Blue = 8, Blackout = 9 }
 
-    // Low-level keyboard hook used only while the screen is blacked out: the first key press
-    // ends the blackout and is swallowed (so e.g. Space doesn't also unpause a video).
-    class KeyWatch : IDisposable
+    // Low-level keyboard + mouse hooks, installed only while the screen is off. The first key
+    // press wakes and is swallowed (so Space doesn't also unpause a video); mouse buttons wake and
+    // are swallowed; mouse movement wakes after a short grace period (Windows itself wakes the
+    // monitor on movement, so the overlay must lift at the same moment).
+    class InputWatch : IDisposable
     {
         delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll", SetLastError = true)] static extern IntPtr SetWindowsHookEx(int id, HookProc fn, IntPtr hMod, uint tid);
         [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr h);
         [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr h, int nCode, IntPtr w, IntPtr l);
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr GetModuleHandle(string name);
-        const int WH_KEYBOARD_LL = 13, WM_KEYDOWN = 0x100, WM_KEYUP = 0x101, WM_SYSKEYDOWN = 0x104, WM_SYSKEYUP = 0x105;
+        const int WH_KEYBOARD_LL = 13, WH_MOUSE_LL = 14;
+        const int WM_KEYDOWN = 0x100, WM_KEYUP = 0x101, WM_SYSKEYDOWN = 0x104, WM_SYSKEYUP = 0x105;
+        const int WM_MOUSEMOVE = 0x200, WM_LBUTTONDOWN = 0x201, WM_RBUTTONDOWN = 0x204, WM_MBUTTONDOWN = 0x207, WM_XBUTTONDOWN = 0x20B, WM_MOUSEWHEEL = 0x20A;
 
-        readonly HookProc proc; // kept alive: the delegate must not be collected while hooked
-        IntPtr hook;
+        readonly HookProc kbProc, msProc; // kept alive: delegates must not be collected while hooked
+        IntPtr kb, ms;
         bool armed;
         int swallowUpVk = -1;
-        public event Action KeyPressed;
+        DateTime moveArmAt;
+        int lastX = int.MinValue, lastY;
+        public event Action Woken;
 
-        public KeyWatch() { proc = Callback; }
+        public InputWatch() { kbProc = KbCallback; msProc = MsCallback; }
 
-        public bool Start()
+        public bool Start(int mouseGraceMs)
         {
             armed = true;
             swallowUpVk = -1;
-            if (hook != IntPtr.Zero) return true;
-            hook = SetWindowsHookEx(WH_KEYBOARD_LL, proc, GetModuleHandle(null), 0);
-            if (hook == IntPtr.Zero) Log.W("keyboard hook failed: " + Marshal.GetLastWin32Error());
-            return hook != IntPtr.Zero;
+            lastX = int.MinValue;
+            moveArmAt = DateTime.UtcNow.AddMilliseconds(mouseGraceMs);
+            IntPtr mod = GetModuleHandle(null);
+            if (kb == IntPtr.Zero) kb = SetWindowsHookEx(WH_KEYBOARD_LL, kbProc, mod, 0);
+            if (ms == IntPtr.Zero) ms = SetWindowsHookEx(WH_MOUSE_LL, msProc, mod, 0);
+            if (kb == IntPtr.Zero) Log.W("keyboard hook failed: " + Marshal.GetLastWin32Error());
+            if (ms == IntPtr.Zero) Log.W("mouse hook failed: " + Marshal.GetLastWin32Error());
+            return kb != IntPtr.Zero;
         }
 
         public void Stop()
         {
             armed = false;
-            if (hook != IntPtr.Zero) { UnhookWindowsHookEx(hook); hook = IntPtr.Zero; }
+            if (ms != IntPtr.Zero) { UnhookWindowsHookEx(ms); ms = IntPtr.Zero; }
+            if (swallowUpVk < 0 && kb != IntPtr.Zero) { UnhookWindowsHookEx(kb); kb = IntPtr.Zero; }
+            // else: keyboard hook lingers just long enough to eat the matching key-up
         }
 
-        IntPtr Callback(int nCode, IntPtr wParam, IntPtr lParam)
+        void Fire()
+        {
+            armed = false;
+            if (Woken != null) Woken();
+        }
+
+        IntPtr KbCallback(int nCode, IntPtr wParam, IntPtr lParam)
         {
             if (nCode >= 0)
             {
@@ -130,23 +149,48 @@ namespace NightDimmer
                 int vk = Marshal.ReadInt32(lParam); // KBDLLHOOKSTRUCT.vkCode
                 if (armed && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN))
                 {
-                    armed = false;
                     swallowUpVk = vk;
-                    if (KeyPressed != null) KeyPressed();
+                    Fire();
                     return new IntPtr(1);
                 }
                 if ((msg == WM_KEYUP || msg == WM_SYSKEYUP) && vk == swallowUpVk)
                 {
                     swallowUpVk = -1;
-                    Stop();                        // matching key-up eaten too, then we're done
+                    if (!armed && kb != IntPtr.Zero) { UnhookWindowsHookEx(kb); kb = IntPtr.Zero; }
                     return new IntPtr(1);
                 }
             }
-            return CallNextHookEx(hook, nCode, wParam, lParam);
+            return CallNextHookEx(kb, nCode, wParam, lParam);
         }
 
-        public void Dispose() { Stop(); }
+        IntPtr MsCallback(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            if (nCode >= 0 && armed)
+            {
+                int msg = wParam.ToInt32();
+                if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN || msg == WM_XBUTTONDOWN || msg == WM_MOUSEWHEEL)
+                {
+                    Fire();
+                    return new IntPtr(1);
+                }
+                if (msg == WM_MOUSEMOVE)
+                {
+                    int x = Marshal.ReadInt32(lParam), y = Marshal.ReadInt32(lParam, 4); // MSLLHOOKSTRUCT.pt
+                    if (lastX == int.MinValue) { lastX = x; lastY = y; }
+                    else if (DateTime.UtcNow >= moveArmAt && (Math.Abs(x - lastX) > 3 || Math.Abs(y - lastY) > 3)) Fire();
+                }
+            }
+            return CallNextHookEx(ms, nCode, wParam, lParam);
+        }
+
+        public void Dispose()
+        {
+            armed = false; swallowUpVk = -1;
+            if (ms != IntPtr.Zero) { UnhookWindowsHookEx(ms); ms = IntPtr.Zero; }
+            if (kb != IntPtr.Zero) { UnhookWindowsHookEx(kb); kb = IntPtr.Zero; }
+        }
     }
+
 
     // =====================================================================
     //  Gamma ramps: dim/warm at the display level so shell UI that sits above
@@ -765,12 +809,12 @@ namespace NightDimmer
             }
 
             // full blackout - any key or click wakes the screen
-            Pill black = new Pill(); black.Text = "⏻   Black out screen   ·   any key wakes it";
+            Pill black = new Pill(); black.Text = "⏻   Turn screen off   ·   any key or mouse wakes it";
             black.Font = Theme.Font(9.5f, FontStyle.Regular);
             black.SetBounds(S(P), S(Y_BLACKOUT), S(W - 2 * P), S(36));
             black.Click += delegate { blackoutFn(); };
             Controls.Add(black);
-            tip.SetToolTip(black, "Turns every screen fully black (Ctrl+Alt+B). Press any key or click to wake.");
+            tip.SetToolTip(black, "Powers off every monitor (Ctrl+Alt+B). Any key, click or mouse movement wakes them.");
 
             // shown only while Windows caps gamma at 50%
             unlockLink = new Pill(); unlockLink.Text = "Unlock full range (admin)"; unlockLink.Borderless = true;
@@ -927,7 +971,7 @@ namespace NightDimmer
 
             Txt(g, "Start with Windows", fSub, P, Y_START + 3, Theme.Text);
 
-            Txt(g, "Ctrl+Alt+D  panel   ·   0  on / off   ·   B  blackout", fHint, P, Y_FOOT - 2, Theme.Muted);
+            Txt(g, "Ctrl+Alt+D  panel   ·   0  on / off   ·   B  screen off", fHint, P, Y_FOOT - 2, Theme.Muted);
             Txt(g, "Ctrl+Alt+ − / =  dim   ·   9  warmth   ·   8  blue", fHint, P, Y_FOOT + 13, Theme.Muted);
         }
 
@@ -957,7 +1001,7 @@ namespace NightDimmer
         readonly System.Windows.Forms.Timer topTimer;
         readonly Icon iconOn, iconOff;
         readonly Gamma gamma;
-        readonly KeyWatch keys = new KeyWatch();
+        readonly InputWatch input = new InputWatch();
         bool blackout;
 
         PanelForm panel;
@@ -1002,7 +1046,7 @@ namespace NightDimmer
             hotkeysOk &= Reg(HK_PANEL,    ca, Keys.D);
             hotkeysOk &= Reg(HK_BLUE,     ca, Keys.D8);
             hotkeysOk &= Reg(HK_BLACKOUT, ca, Keys.B);
-            keys.KeyPressed += delegate { EndBlackout(true); };
+            input.Woken += delegate { EndBlackout(); };
 
             SystemEvents.DisplaySettingsChanged += delegate { gamma.Refresh(); BuildOverlays(); };
             SystemEvents.PowerModeChanged += delegate(object o, PowerModeChangedEventArgs e)
@@ -1085,13 +1129,18 @@ namespace NightDimmer
             foreach (Screen sc in Screen.AllScreens)
             {
                 OverlayForm f = new OverlayForm(sc.Bounds);
-                f.Clicked += delegate { EndBlackout(false); };
+                f.Clicked += delegate { EndBlackout(); };
                 overlays.Add(f);
             }
             if (blackout) { blackout = false; StartBlackout(); } else Apply();
         }
 
-        // ---- blackout ---------------------------------------------------------
+        // ---- blackout / screen off ----------------------------------------------
+        //
+        // Overlay goes black immediately (no bright flash, and a fallback where DPMS is not
+        // supported, e.g. Remote Desktop), then the monitors are told to power off. Any key,
+        // mouse button or mouse movement wakes: the hooks lift the overlay and we switch the
+        // monitors back on explicitly, since a swallowed key may not count as wake input.
 
         void StartBlackout()
         {
@@ -1100,23 +1149,34 @@ namespace NightDimmer
             Log.W("blackout on");
             if (panel != null && !panel.IsDisposed) panel.Close();
             foreach (OverlayForm f in overlays) f.SetBlackout(true);
-            if (!keys.Start())
-                tray.ShowBalloonTip(4000, "Night Dimmer", "Couldn't watch the keyboard - click the mouse or press Ctrl+Alt+B to end the blackout.", ToolTipIcon.Warning);
-            tray.Text = "Night Dimmer: screen blacked out - any key wakes it";
+            if (!input.Start(1500))
+                tray.ShowBalloonTip(4000, "Night Dimmer", "Couldn't watch the keyboard - move or click the mouse, or press Ctrl+Alt+B, to wake the screen.", ToolTipIcon.Warning);
+            tray.Text = "Night Dimmer: screen off - any key or mouse wakes it";
+            // Give the click/keystroke that started this a moment to settle, or the display wakes straight back up.
+            System.Windows.Forms.Timer t = new System.Windows.Forms.Timer();
+            t.Interval = 600;
+            t.Tick += delegate { t.Stop(); t.Dispose(); if (blackout) MonitorPower(false); };
+            t.Start();
         }
 
-        // fromKey: the hook ends itself once it has eaten the key-up; otherwise stop it here.
-        void EndBlackout(bool fromKey)
+        void EndBlackout()
         {
-            if (!fromKey) keys.Stop();
+            input.Stop();
             if (!blackout) return;
             blackout = false;
             Log.W("blackout off");
+            MonitorPower(true);
             foreach (OverlayForm f in overlays) f.SetBlackout(false);
             Apply();
         }
 
-        void ToggleBlackout() { if (blackout) EndBlackout(false); else StartBlackout(); }
+        void ToggleBlackout() { if (blackout) EndBlackout(); else StartBlackout(); }
+
+        void MonitorPower(bool on)
+        {
+            // WM_SYSCOMMAND / SC_MONITORPOWER handled by DefWindowProc of any window we own.
+            Native.SendMessage(hk.Handle, Native.WM_SYSCOMMAND, new IntPtr(Native.SC_MONITORPOWER), new IntPtr(on ? -1 : 2));
+        }
 
         static Color TintFor(int warmth)
         {
@@ -1174,7 +1234,7 @@ namespace NightDimmer
         void OnHotkey(int id)
         {
             if (id > HK_ALT) id -= HK_ALT;
-            if (blackout && id != HK_BLACKOUT) { EndBlackout(false); return; } // any hotkey wakes, nothing more
+            if (blackout && id != HK_BLACKOUT) { EndBlackout(); return; } // any hotkey wakes, nothing more
             switch (id)
             {
                 case HK_BLACKOUT: ToggleBlackout(); return;
@@ -1297,7 +1357,7 @@ namespace NightDimmer
         {
             Log.W("exit");
             topTimer.Stop();
-            keys.Dispose();
+            input.Dispose();
             gamma.Restore();
             if (panel != null && !panel.IsDisposed) panel.Close();
             foreach (OverlayForm f in overlays) f.Close();

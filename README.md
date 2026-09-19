@@ -13,7 +13,7 @@
 
 Ever watched something at night and found your monitor's *lowest* brightness still too bright?
 Night Dimmer goes darker than the hardware allows, adds an amber tone, cuts blue light, and can
-black the screen out entirely until you touch a key — with a dark control panel, global hotkeys,
+switch your monitors off entirely until you touch a key or the mouse — with a dark control panel, global hotkeys,
 and presets. It's a single 1,000-line C# file with no
 dependencies, and it compiles on your own PC in about two seconds.
 
@@ -43,12 +43,12 @@ files. Or just run `build.ps1` and use the exe where it lands.
 | Darker / brighter, 5% steps | **Ctrl+Alt+-** / **Ctrl+Alt+=** |
 | Cycle warmth | **Ctrl+Alt+9** |
 | Cycle blue-light filter | **Ctrl+Alt+8** |
-| **Black out the screen** | **Ctrl+Alt+B** or the panel button — *any key or click wakes it* (the key is swallowed, so Space won't unpause your video) |
+| **Screen off** | **Ctrl+Alt+B** or the panel button — powers your monitors off (real DPMS off, with a black overlay underneath as a fallback). *Any key, click or mouse movement wakes them*; the waking key is swallowed, so Space won't unpause your video |
 | Quit | the **✕** in the panel's corner |
 
 Alternate bindings if another app owns those: Ctrl+Alt+**PgDn / PgUp / End / Home**.
 
-**Sliders.** *Dim* lowers brightness (0–90%; the dimmer itself never fully blacks out — that is what Blackout is for). *Warmth* shifts
+**Sliders.** *Dim* lowers brightness (0–90%; the dimmer itself never fully blacks out — that is what Screen off is for). *Warmth* shifts
 the tone amber, like Night Light. *Blue light filter* cuts only the blue channel.
 **Presets:** Subtle 30/20/20 · Movie 60/45/40 · Cave 85/65/60.
 
