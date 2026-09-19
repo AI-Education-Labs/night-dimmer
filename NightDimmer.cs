@@ -26,14 +26,14 @@ using Microsoft.Win32;
 [assembly: System.Reflection.AssemblyDescription("Dim and warm your screen for night viewing")]
 [assembly: System.Reflection.AssemblyCompany("AI Education Labs")]
 [assembly: System.Reflection.AssemblyCopyright("Copyright © 2026 AI Education Labs. MIT License.")]
-[assembly: System.Reflection.AssemblyVersion("1.2.1.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.2.1.0")]
+[assembly: System.Reflection.AssemblyVersion("1.2.2.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.2.2.0")]
 
 namespace NightDimmer
 {
     static class About
     {
-        public const string Version = "1.2.1";
+        public const string Version = "1.2.2";
         public const string Company = "AI Education Labs";
         public const string Site = "https://aiedlabs.com";
         public const string Repo = "https://github.com/AI-Education-Labs/night-dimmer";
@@ -72,6 +72,8 @@ namespace NightDimmer
         [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
         [DllImport("user32.dll")] public static extern bool ReleaseCapture();
+        public const uint LWA_ALPHA = 2;
+        [DllImport("user32.dll")] public static extern bool SetLayeredWindowAttributes(IntPtr hWnd, uint key, byte alpha, uint flags);
         [DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
     }
 
@@ -829,10 +831,16 @@ namespace NightDimmer
                     using (Bitmap b = new Bitmap(32, 32)) blank = new Cursor(b.GetHicon());
                 Cursor = blank;
                 BackColor = Color.Black;
-                Opacity = 1;
                 if (!Visible) Show();
+                // WinForms only pushes alpha for Opacity < 1, so force the layered window fully opaque ourselves.
+                Native.SetLayeredWindowAttributes(Handle, 0, 255, Native.LWA_ALPHA);
             }
-            else Cursor = Cursors.Default;
+            else
+            {
+                Cursor = Cursors.Default;
+                // ...and put the dimmer's alpha back (Apply() may set the same Opacity value, which WinForms would skip).
+                Native.SetLayeredWindowAttributes(Handle, 0, (byte)Math.Round(Opacity * 255), Native.LWA_ALPHA);
+            }
             ReassertTopmost();
         }
 
