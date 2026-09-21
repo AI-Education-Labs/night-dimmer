@@ -26,14 +26,14 @@ using Microsoft.Win32;
 [assembly: System.Reflection.AssemblyDescription("Dim and warm your screen for night viewing")]
 [assembly: System.Reflection.AssemblyCompany("AI Education Labs")]
 [assembly: System.Reflection.AssemblyCopyright("Copyright © 2026 AI Education Labs. MIT License.")]
-[assembly: System.Reflection.AssemblyVersion("1.2.2.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.2.2.0")]
+[assembly: System.Reflection.AssemblyVersion("1.2.3.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.2.3.0")]
 
 namespace NightDimmer
 {
     static class About
     {
-        public const string Version = "1.2.2";
+        public const string Version = "1.2.3";
         public const string Company = "AI Education Labs";
         public const string Site = "https://aiedlabs.com";
         public const string Repo = "https://github.com/AI-Education-Labs/night-dimmer";
@@ -988,6 +988,14 @@ namespace NightDimmer
             Controls.Add(close);
             ToolTip tip = new ToolTip(); tip.SetToolTip(close, "Quit Night Dimmer (turns the filter off)");
 
+            // minimize to the taskbar (filter keeps running; Ctrl+Alt+D or the tray icon brings it back)
+            Pill mini = new Pill(); mini.Text = "–"; mini.Borderless = true;
+            mini.Font = Theme.Font(11f, FontStyle.Bold);
+            mini.SetBounds(S(W - P - 24 - 34), S(Y_HEADER - 6), S(30), S(30));
+            mini.Click += delegate { WindowState = FormWindowState.Minimized; };
+            Controls.Add(mini);
+            tip.SetToolTip(mini, "Minimize");
+
             // master toggle
             master = new Toggle(); master.SetBounds(S(W - P - 46), S(Y_MASTER + 1), S(46), S(26));
             master.CheckedChanged += delegate { if (syncing) return; s.Enabled = master.Checked; if (s.Enabled && s.Dim == 0) s.Dim = 30; changed(); };
@@ -1526,6 +1534,7 @@ namespace NightDimmer
             }
             panel.Sync();
             if (!panel.Visible) panel.Show();
+            if (panel.WindowState == FormWindowState.Minimized) panel.WindowState = FormWindowState.Normal;
             panel.Activate();
             Native.SetForegroundWindow(panel.Handle);
             // keep the filter above the panel so the sliders preview live
