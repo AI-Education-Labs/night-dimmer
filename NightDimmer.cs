@@ -26,14 +26,14 @@ using Microsoft.Win32;
 [assembly: System.Reflection.AssemblyDescription("Dim and warm your screen for night viewing")]
 [assembly: System.Reflection.AssemblyCompany("AI Education Labs")]
 [assembly: System.Reflection.AssemblyCopyright("Copyright © 2026 AI Education Labs. MIT License.")]
-[assembly: System.Reflection.AssemblyVersion("1.2.3.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.2.3.0")]
+[assembly: System.Reflection.AssemblyVersion("1.2.4.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.2.4.0")]
 
 namespace NightDimmer
 {
     static class About
     {
-        public const string Version = "1.2.3";
+        public const string Version = "1.2.4";
         public const string Company = "AI Education Labs";
         public const string Site = "https://aiedlabs.com";
         public const string Repo = "https://github.com/AI-Education-Labs/night-dimmer";
@@ -736,6 +736,7 @@ namespace NightDimmer
         bool hover, down, active;
         public bool Borderless;
         public bool Danger; // hover turns red: destructive action
+        public Color Tint = Color.Empty; // resting fill, for buttons that must stay visible on a dark screen
         public bool Active { get { return active; } set { active = value; Invalidate(); } }
 
         public Pill()
@@ -766,10 +767,15 @@ namespace NightDimmer
             Color fill = down ? Theme.Hover : (hover ? Theme.Surface : (active ? Theme.Surface : BackColor));
             Color border = active ? Theme.Accent : (Borderless ? Color.Transparent : Theme.Border);
             Color text = active ? Theme.Accent : (hover ? Theme.Text : Theme.Muted);
-            if (Danger && hover) { fill = Color.FromArgb(70, 200, 60, 50); text = Color.FromArgb(255, 120, 110); }
+            if (Tint != Color.Empty)
+            {
+                fill = down ? Theme.Lerp(Tint, Theme.Text, 0.28f) : (hover ? Theme.Lerp(Tint, Theme.Text, 0.14f) : Tint);
+                text = Color.FromArgb(240, 214, 198);
+            }
+            if (Danger && hover) { fill = Color.FromArgb(200, 60, 50); text = Color.FromArgb(255, 236, 230); }
             using (GraphicsPath gp = Theme.Round(r, Height / 2f))
             {
-                if (fill != BackColor || active) using (SolidBrush b = new SolidBrush(active && !hover ? Color.FromArgb(28, Theme.Accent) : fill)) g.FillPath(b, gp);
+                if (fill != BackColor || active || Tint != Color.Empty) using (SolidBrush b = new SolidBrush(active && !hover ? Color.FromArgb(28, Theme.Accent) : fill)) g.FillPath(b, gp);
                 if (border.A > 0) using (Pen p = new Pen(border, 1f)) g.DrawPath(p, gp);
             }
             TextRenderer.DrawText(g, Text, Font, new Rectangle(0, 0, Width, Height), text,
@@ -981,7 +987,8 @@ namespace NightDimmer
             fHint = Theme.Font(8f, FontStyle.Regular);
 
             // X quits the whole app (the footer "Hide" just dismisses the panel)
-            Pill close = new Pill(); close.Text = "✕"; close.Borderless = true; close.Danger = true;
+            Color headerTint = Color.FromArgb(112, 58, 46); // reddish brown, readable even under a heavy dim
+            Pill close = new Pill(); close.Text = "✕"; close.Borderless = true; close.Danger = true; close.Tint = headerTint;
             close.Font = Theme.Font(10f, FontStyle.Regular);
             close.SetBounds(S(W - P - 24), S(Y_HEADER - 6), S(30), S(30));
             close.Click += delegate { exit(); };
@@ -989,7 +996,7 @@ namespace NightDimmer
             ToolTip tip = new ToolTip(); tip.SetToolTip(close, "Quit Night Dimmer (turns the filter off)");
 
             // minimize to the taskbar (filter keeps running; Ctrl+Alt+D or the tray icon brings it back)
-            Pill mini = new Pill(); mini.Text = "–"; mini.Borderless = true;
+            Pill mini = new Pill(); mini.Text = "–"; mini.Borderless = true; mini.Tint = headerTint;
             mini.Font = Theme.Font(11f, FontStyle.Bold);
             mini.SetBounds(S(W - P - 24 - 34), S(Y_HEADER - 6), S(30), S(30));
             mini.Click += delegate { WindowState = FormWindowState.Minimized; };
